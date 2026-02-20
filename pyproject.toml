@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kv-secrets"
+version = "0.1.0"
+description = "Encrypted secrets management for developers and AI agents"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["secrets", "encryption", "mcp", "cli", "devtools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = ["cryptography>=41.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/sathi/kv-secrets"
+Documentation = "https://github.com/sathi/kv-secrets#readme"
+Issues = "https://github.com/sathi/kv-secrets/issues"
+
+[project.scripts]
+kv = "kv.cli:main"
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.29.0",
+    "python-jose[cryptography]>=3.3.0",
+    "bcrypt>=4.0.0",
+    "stripe>=8.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["kv", "kv_mcp", "kv_server"]
