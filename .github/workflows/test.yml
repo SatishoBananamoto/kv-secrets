@@ -22,20 +22,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install package
-        run: pip install -e .
+        run: pip install .
 
       - name: Verify packages importable
         run: python -c "import kv; import kv_mcp; print('core packages OK')"
 
       - name: Run MCP tests
         run: python -Bu tests/test_mcp.py
-        env:
-          PYTHONPATH: .
 
       - name: Install server dependencies
-        run: pip install -e ".[server]"
+        run: pip install ".[server]"
+
+      - name: Verify server package importable
+        run: python -c "import kv_server; print('server package OK')"
 
       - name: Run e2e tests
         run: python -Bu tests/test_e2e.py
-        env:
-          PYTHONPATH: .
