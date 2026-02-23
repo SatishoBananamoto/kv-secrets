@@ -24,11 +24,18 @@ jobs:
       - name: Install package
         run: pip install -e .
 
+      - name: Verify packages importable
+        run: python -c "import kv; import kv_mcp; print('core packages OK')"
+
       - name: Run MCP tests
         run: python -Bu tests/test_mcp.py
+        env:
+          PYTHONPATH: .
 
       - name: Install server dependencies
         run: pip install -e ".[server]"
 
       - name: Run e2e tests
         run: python -Bu tests/test_e2e.py
+        env:
+          PYTHONPATH: .
