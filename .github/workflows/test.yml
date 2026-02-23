@@ -27,5 +27,20 @@ jobs:
       - name: Verify packages importable
         run: python -c "import kv; import kv_mcp; print('core packages OK')"
 
+      - name: Guard — no private code in wheel
+        run: |
+          pip wheel --no-deps -w /tmp/whl .
+          python -c "
+          import zipfile, glob, sys
+          whl = glob.glob('/tmp/whl/*.whl')[0]
+          entries = zipfile.ZipFile(whl).namelist()
+          leaked = [e for e in entries if e.startswith('kv_server/')]
+          if leaked:
+              print('FATAL: private code leaked into wheel:')
+              for f in leaked: print(f'  {f}')
+              sys.exit(1)
+          print('Guard passed: wheel contains no private code')
+          "
+
       - name: Run MCP tests
         run: python -Bu tests/test_mcp.py

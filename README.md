@@ -171,7 +171,7 @@ kv setup EDITOR    Configure MCP for your editor
 kv mcp             Show MCP server config JSON
 ```
 
-**Remote (cloud sync — coming soon)**
+**Remote (requires [kvsecure.com](https://kvsecure.com) account — coming soon)**
 
 ```
 kv signup          Create account
