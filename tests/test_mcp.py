@@ -1017,6 +1017,204 @@ def test_session_blank_lines_dont_disconnect():
 
 # --Main ---------------------------------------------------
 
+# ── kv doctor tests ───────────────────────────────────────
+
+
+def _run_doctor_in_dir(tmpdir):
+    """Run kv doctor in a directory using subprocess."""
+    result = subprocess.run(
+        [sys.executable, "-m", "kv", "doctor"],
+        cwd=tmpdir,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    out = result.stdout.decode("utf-8", errors="replace")
+    err = result.stderr.decode("utf-8", errors="replace")
+    return result.returncode, out, err
+
+
+def test_doctor_healthy_project():
+    """Doctor on a fully initialized project with a secret should pass."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        setup_kv_project(tmpdir)
+        store = SecretStore(tmpdir)
+        store.set_secret("dev", "TEST_KEY", "test_value")
+
+        exit_code, stdout, stderr = _run_doctor_in_dir(tmpdir)
+        combined = stdout + stderr
+
+        test("doctor exits 0 on healthy project", exit_code == 0,
+             f"exit={exit_code}, out={combined[:300]}")
+        test("doctor reports Python version", "Python" in combined,
+             combined[:300])
+        test("doctor reports project found", "Project found" in combined,
+             combined[:300])
+        test("doctor reports master key", "Master key" in combined,
+             combined[:300])
+        test("doctor reports decrypt OK", "Decrypt OK" in combined,
+             combined[:300])
+        test("doctor shows passed count", "passed" in combined,
+             combined[:300])
+
+
+def test_doctor_missing_key():
+    """Doctor with missing key file should exit 1."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        setup_kv_project(tmpdir)
+        # Delete the key file
+        key_file = os.path.join(tmpdir, ".secrets", "key")
+        os.remove(key_file)
+
+        exit_code, stdout, stderr = _run_doctor_in_dir(tmpdir)
+        combined = stdout + stderr
+
+        test("doctor exits 1 with missing key", exit_code == 1,
+             f"exit={exit_code}, out={combined[:300]}")
+        test("doctor reports key problem",
+             "missing" in combined.lower() or "error" in combined.lower(),
+             combined[:300])
+
+
+def _run_cmd_in_dir(tmpdir, cmd_args, env_override=None):
+    """Run a kv command in a directory. Returns (exit_code, stdout, stderr)."""
+    env = os.environ.copy()
+    if env_override:
+        env.update(env_override)
+    result = subprocess.run(
+        [sys.executable, "-m", "kv"] + cmd_args,
+        cwd=tmpdir, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    out = result.stdout.decode("utf-8", errors="replace")
+    err = result.stderr.decode("utf-8", errors="replace")
+    return result.returncode, out, err
+
+
+def test_env_var_invalid_key_rejected():
+    """KV_MASTER_KEY with wrong size must fail fast, not write .enc."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        setup_kv_project(tmpdir)
+        # Delete the key file
+        key_file = os.path.join(tmpdir, ".secrets", "key")
+        os.remove(key_file)
+
+        enc_path = os.path.join(tmpdir, ".secrets", "dev.enc")
+        enc_existed = os.path.isfile(enc_path)
+
+        # Try kv set with a 3-byte key (AAAA decodes to 3 bytes)
+        exit_code, stdout, stderr = _run_cmd_in_dir(
+            tmpdir, ["set", "BAD=val"], env_override={"KV_MASTER_KEY": "AAAA"}
+        )
+        combined = stdout + stderr
+
+        test("invalid env key: kv set exits non-zero", exit_code != 0,
+             f"exit={exit_code}, out={combined[:300]}")
+        test("invalid env key: error mentions size",
+             "32" in combined or "invalid" in combined.lower(),
+             combined[:300])
+        # Ensure no .enc was written
+        enc_after = os.path.isfile(enc_path)
+        test("invalid env key: no .enc written",
+             enc_after == enc_existed,
+             f"enc_before={enc_existed}, enc_after={enc_after}")
+
+
+def test_env_var_key_fallback():
+    """KV_MASTER_KEY env var should work when key file is absent."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        setup_kv_project(tmpdir)
+        store = SecretStore(tmpdir)
+        store.set_secret("dev", "TESTVAR", "hello123")
+
+        # Read the key, then delete the file
+        key_file = os.path.join(tmpdir, ".secrets", "key")
+        with open(key_file, "r") as f:
+            key_b64 = f.read().strip()
+        os.remove(key_file)
+
+        # Run kv ls with KV_MASTER_KEY env var — should still list secrets
+        exit_code, stdout, stderr = _run_cmd_in_dir(
+            tmpdir, ["ls"], env_override={"KV_MASTER_KEY": key_b64}
+        )
+        combined = stdout + stderr
+
+        test("env var fallback: kv ls exits 0", exit_code == 0,
+             f"exit={exit_code}, out={combined[:300]}")
+        test("env var fallback: lists the secret", "TESTVAR" in combined,
+             combined[:300])
+
+
+def test_export_key_roundtrip():
+    """export-key then import-key should preserve the key."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        setup_kv_project(tmpdir)
+        store = SecretStore(tmpdir)
+        store.set_secret("dev", "ROUNDTRIP", "secretval")
+
+        # Export key
+        exit_code, stdout, stderr = _run_cmd_in_dir(tmpdir, ["export-key"])
+        test("export-key exits 0", exit_code == 0,
+             f"exit={exit_code}, err={stderr[:200]}")
+
+        # Extract the kvkey_ token from output
+        token = ""
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("kvkey_"):
+                token = line
+                break
+        test("export-key outputs kvkey_ token", token.startswith("kvkey_"),
+             f"stdout={stdout[:200]}")
+
+        if token:
+            # Delete key file
+            key_file = os.path.join(tmpdir, ".secrets", "key")
+            os.remove(key_file)
+
+            # Import key
+            exit_code, stdout, stderr = _run_cmd_in_dir(
+                tmpdir, ["import-key", token]
+            )
+            test("import-key exits 0", exit_code == 0,
+                 f"exit={exit_code}, err={stderr[:200]}")
+
+            # Verify we can still read the secret
+            exit_code, stdout, stderr = _run_cmd_in_dir(tmpdir, ["get", "ROUNDTRIP"])
+            combined = stdout + stderr
+            test("roundtrip: secret still readable", "secretval" in combined,
+                 combined[:200])
+
+
+def test_doctor_env_var_fallback():
+    """Doctor should pass key check when KV_MASTER_KEY is set and file absent."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        setup_kv_project(tmpdir)
+
+        # Read key, then delete the file
+        key_file = os.path.join(tmpdir, ".secrets", "key")
+        with open(key_file, "r") as f:
+            key_b64 = f.read().strip()
+        os.remove(key_file)
+
+        # Run doctor with env var
+        env = os.environ.copy()
+        env["KV_MASTER_KEY"] = key_b64
+        result = subprocess.run(
+            [sys.executable, "-m", "kv", "doctor"],
+            cwd=tmpdir, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        combined = result.stdout.decode("utf-8", errors="replace") + \
+                   result.stderr.decode("utf-8", errors="replace")
+
+        test("doctor with env var exits 0", result.returncode == 0,
+             f"exit={result.returncode}, out={combined[:300]}")
+        test("doctor reports env var key", "KV_MASTER_KEY" in combined,
+             combined[:300])
+
+
 def main():
     print()
     print("  \033[1m\033[38;2;140;180;255mkv_mcp\033[0m \033[2m--\033[0m integration tests")
@@ -1068,6 +1266,18 @@ def main():
     test_setup_non_object_servers_aborts()
     test_setup_root_array_aborts()
     test_setup_with_mutate_reveal_flags()
+    print()
+
+    print("  \033[2m── kv doctor ──\033[0m")
+    test_doctor_healthy_project()
+    test_doctor_missing_key()
+    test_doctor_env_var_fallback()
+    print()
+
+    print("  \033[2m── kv export-key / import-key / env var ──\033[0m")
+    test_env_var_invalid_key_rejected()
+    test_env_var_key_fallback()
+    test_export_key_roundtrip()
     print()
 
     print("  \033[2m── Full Session (stdio simulation) ──\033[0m")

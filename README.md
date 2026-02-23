@@ -1,36 +1,28 @@
 # kv
 
+[![tests](https://github.com/SatishoBananamoto/kv-secrets/actions/workflows/test.yml/badge.svg)](https://github.com/SatishoBananamoto/kv-secrets/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/kv-secrets)](https://pypi.org/project/kv-secrets/)
+[![Python](https://img.shields.io/pypi/pyversions/kv-secrets)](https://pypi.org/project/kv-secrets/)
+[![License](https://img.shields.io/github/license/SatishoBananamoto/kv-secrets)](LICENSE)
+
 Encrypted secrets management for developers and AI coding agents.
 
-**kv** encrypts your API keys, database URLs, and tokens with ChaCha20-Poly1305 — then lets your AI editor (Cursor, Claude Code, VS Code) use them safely through MCP.
+**kv** encrypts your API keys, database URLs, and tokens with ChaCha20-Poly1305 — then lets your AI editor (Cursor, Claude Code, VS Code) use them safely through MCP. Your AI agent never sees the plaintext values.
 
 ```
 pip install kv-secrets
 ```
 
-## Why kv?
-
-Your AI coding agent needs your API keys to run and test code. But pasting secrets into chat is dangerous — they end up in logs, training data, and prompt history.
-
-**kv keeps secrets encrypted on disk and injects them only at runtime.** Your AI agent never sees the plaintext values.
-
-## Quick Start
+## Get Started in 30 Seconds
 
 ```bash
-# Initialize in your project
-kv init
-
-# Store secrets
-kv set API_KEY sk-live-abc123
-kv set DATABASE_URL postgres://user:pass@host/db
-
-# Run commands with secrets injected
-kv run -- python app.py
-kv run -- npm start
-
-# List keys (values stay hidden)
-kv ls
+cd your-project
+kv init                              # Create encrypted vault
+kv set API_KEY sk-live-abc123        # Store a secret
+kv run -- python app.py              # Run with secrets injected
 ```
+
+That's it. Your secrets are encrypted on disk. The `kv run` command injects them as environment variables at runtime — they never touch plaintext files, chat logs, or AI context.
 
 ## MCP Integration (AI Editors)
 
@@ -43,7 +35,7 @@ kv setup claude-code
 kv setup vscode
 ```
 
-That's it. Your AI agent now has access to these tools:
+Your AI agent now has access to these tools:
 
 | Tool | Profile | What it does |
 |------|---------|-------------|
@@ -68,6 +60,27 @@ kv setup cursor --allow-mutate
 kv setup cursor --allow-reveal
 ```
 
+## Use in GitHub Actions
+
+Your `.enc` files are safe to commit — they're encrypted noise without the key. Use this in CI:
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Install kv
+    run: pip install kv-secrets
+
+  - name: Run tests with secrets
+    run: kv run -- pytest
+    env:
+      # Copy the contents of .secrets/key into a GitHub Actions secret
+      # named KV_MASTER_KEY — kv reads it automatically when the file is absent
+      KV_MASTER_KEY: ${{ secrets.KV_MASTER_KEY }}
+```
+
+Commit `.secrets/*.enc` and `.secrets/config.json` to git. The `.secrets/key` file is auto-gitignored. In CI, kv reads the master key from the `KV_MASTER_KEY` environment variable when the key file isn't present.
+
 ## How It Works
 
 ```
@@ -85,23 +98,45 @@ AI Agent                          kv
 Secret values never appear in the chat.
 ```
 
+## Diagnostics
+
+Verify your setup:
+
+```bash
+kv doctor
+```
+
+```
+  kv -- doctor
+
+  ✓ Python 3.12.3
+  ✓ Project found
+  ✓ Master key readable (256-bit)
+  ✓ Config valid (2 environments)
+  ✓ Decrypt OK  dev (3 secrets)
+  ✓ MCP server module available
+  ✓ Cursor MCP configured
+
+  7 passed
+```
+
 ## Encryption
 
-- **Algorithm:** ChaCha20-Poly1305 (AEAD)
+- **Algorithm:** ChaCha20-Poly1305 (AEAD) — same cipher family as WireGuard
 - **Key derivation:** BLAKE2b with environment name as context
 - **Storage:** Binary `.enc` files — safe to commit to git
-- **Master key:** Stored in `.secrets/key` — add to `.gitignore`
+- **Master key:** 256-bit random, stored in `.secrets/key` — never commit this
 
 ## Multi-Environment
 
 ```bash
-# Switch environments
-kv env staging
-kv env prod
+# Create environments
+kv env create staging
+kv env create prod
 
 # Set per-environment secrets
-kv set API_KEY sk-live-prod --env prod
 kv set API_KEY sk-test-dev --env dev
+kv set API_KEY sk-live-prod --env prod
 
 # Run in specific environment
 kv run --env prod -- python deploy.py
@@ -109,20 +144,42 @@ kv run --env prod -- python deploy.py
 
 ## All Commands
 
+**Local**
+
 ```
-kv init          Initialize kv in current project
-kv set KEY VAL   Store an encrypted secret
-kv get KEY       Decrypt and print a secret
-kv ls            List secret names
-kv rm KEY        Remove a secret
-kv run -- CMD    Run command with secrets in env
-kv envs          List environments
-kv env NAME      Switch default environment
-kv export        Export as .env format
-kv import FILE   Import from .env file
-kv status        Show project info
-kv setup EDITOR  Configure MCP for your editor
-kv version       Print version
+kv init            Initialize kv in current project
+kv set KEY VAL     Store an encrypted secret
+kv get KEY         Decrypt and print a secret
+kv ls              List secret names
+kv rm KEY          Remove a secret
+kv run -- CMD      Run command with secrets in env
+kv envs            List environments
+kv env create NAME Create a new environment
+kv export          Export as .env format
+kv import FILE     Import from .env file
+kv export-key      Export master key as shareable string
+kv import-key TOK  Import a shared master key
+kv status          Show project info
+kv doctor          Check project health
+kv version         Print version
+```
+
+**MCP (AI editors)**
+
+```
+kv setup EDITOR    Configure MCP for your editor
+kv mcp             Show MCP server config JSON
+```
+
+**Remote (cloud sync — coming soon)**
+
+```
+kv signup          Create account
+kv login / logout  Sign in / sign out
+kv push / pull     Sync encrypted secrets to cloud
+kv remote          Show sync status
+kv team            Manage team members
+kv token           Manage API tokens for CI/CD
 ```
 
 ## Key Sharing
@@ -140,7 +197,21 @@ kv import-key kvkey_dGhpcyBpcyBhIHRlc3Qga2V5...
 
 The `.enc` files are safe to commit — without the key, they're just noise.
 
-## Security Model
+## Comparison
+
+| Feature | kv | .env files | 1Password CLI | HashiCorp Vault |
+|---------|:--:|:----------:|:-------------:|:---------------:|
+| Encrypted at rest | Yes | No | Yes | Yes |
+| MCP server for AI agents | Yes | No | No | No |
+| Zero config setup | Yes | Yes | No | No |
+| Works offline | Yes | Yes | No | No |
+| Free for individuals | Yes | Yes | No | No |
+| Single dependency | Yes | Yes | No | No |
+| Team sharing (paid) | Yes | No | Yes | Yes |
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the full security model, vulnerability reporting process, and static analysis status.
 
 | What | Where | Safe to share? |
 |------|-------|---------------|
@@ -148,9 +219,10 @@ The `.enc` files are safe to commit — without the key, they're just noise.
 | Master key | `.secrets/key` | No (share via secure channel) |
 | Plaintext | Never on disk | N/A |
 
-- Zero-knowledge design — even the cloud sync server (coming soon) never sees plaintext
-- Encrypted blobs are opaque to anyone without the key
-- `kv run` uses `stdout=DEVNULL` — your AI agent only sees exit codes, never output
+- Zero-knowledge architecture — cloud sync server never sees plaintext
+- `kv run` injects secrets via env vars, returns only exit codes
+- MCP profiles gate what AI agents can access (safe/mutate/reveal)
+- Semgrep Pro scanned: 0 blocking findings across 2,538 rules
 
 ## Requirements
 
@@ -159,4 +231,4 @@ The `.enc` files are safe to commit — without the key, they're just noise.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)

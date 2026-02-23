@@ -27,12 +27,25 @@ class SecretStore:
     def master_key(self):
         if self._master_key is None:
             kp = key_path(self.root)
-            if not os.path.isfile(kp):
-                raise FileNotFoundError(
-                    f"master key not found: {kp}\n"
-                    "  run 'kv init' first, or check your .secrets/ directory"
-                )
-            self._master_key = load_key(kp)
+            if os.path.isfile(kp):
+                self._master_key = load_key(kp)
+            else:
+                # CI/CD fallback: base64url-encoded key from environment
+                env_key = os.environ.get("KV_MASTER_KEY", "").strip()
+                if env_key:
+                    import base64
+                    decoded = base64.urlsafe_b64decode(env_key)
+                    if len(decoded) != 32:
+                        raise ValueError(
+                            f"KV_MASTER_KEY invalid: expected 32 bytes, got {len(decoded)}\n"
+                            "  the value should be the base64url contents of .secrets/key"
+                        )
+                    self._master_key = decoded
+                else:
+                    raise FileNotFoundError(
+                        f"master key not found: {kp}\n"
+                        "  run 'kv init' first, or set KV_MASTER_KEY env var for CI"
+                    )
         return self._master_key
 
     def _env_key(self, env_name):

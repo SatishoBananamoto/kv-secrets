@@ -353,6 +353,200 @@ def cmd_mcp(args):
     print()
 
 
+# ── Key Sharing ─────────────────────────────────────────
+
+
+def cmd_export_key(args):
+    """Export master key as a shareable kvkey_ string."""
+    from .crypto import export_key
+    root = _require_project()
+    store = SecretStore(root)
+    token = export_key(store.master_key)
+    _header("export key")
+    print()
+    _info(f"Share this token with teammates via a secure channel:")
+    print()
+    print(f"  {token}")
+    print()
+    _info(f"{DIM}Teammate runs: kv import-key {token[:20]}...{RESET}")
+    print()
+
+
+def cmd_import_key(args):
+    """Import a shared master key from a kvkey_ token."""
+    from .crypto import import_key, save_key
+    root = _require_project()
+    kp = key_path(root)
+
+    if os.path.isfile(kp):
+        _error("master key already exists")
+        _info(f"{DIM}Delete .secrets/key first if you want to replace it{RESET}")
+        sys.exit(1)
+
+    try:
+        raw = import_key(args.token)
+    except Exception as e:
+        _error(f"invalid key token: {e}")
+        sys.exit(1)
+
+    if len(raw) != 32:
+        _error(f"invalid key: expected 32 bytes, got {len(raw)}")
+        sys.exit(1)
+
+    save_key(raw, kp)
+    _success("master key imported successfully")
+
+
+# ── Doctor ──────────────────────────────────────────────
+
+
+def cmd_doctor(args):
+    """Run diagnostics on kv installation and project."""
+    import importlib
+
+    _header("doctor")
+    print()
+
+    errors = 0
+    warnings = 0
+    passed = 0
+
+    def _pass(msg):
+        nonlocal passed
+        passed += 1
+        print(f"  {GREEN}\u2713{RESET} {msg}")
+
+    def _fail(msg):
+        nonlocal errors
+        errors += 1
+        print(f"  {RED}\u2717{RESET} {msg}")
+
+    def _warn(msg):
+        nonlocal warnings
+        warnings += 1
+        print(f"  {YELLOW}!{RESET} {msg}")
+
+    # 1. Python version
+    v = sys.version_info
+    if v >= (3, 10):
+        _pass(f"Python {v.major}.{v.minor}.{v.micro}")
+    else:
+        _fail(f"Python {v.major}.{v.minor}.{v.micro} (3.10+ required)")
+
+    # 2. Project initialized
+    root = find_project_root()
+    if root:
+        _pass(f"Project found  {DIM}{root}{RESET}")
+    else:
+        _fail("No kv project found (run kv init)")
+        print()
+        _print_doctor_summary(passed, errors, warnings)
+        sys.exit(1)
+
+    # 3. Master key (file or KV_MASTER_KEY env var)
+    kp = key_path(root)
+    key = None
+    if os.path.isfile(kp):
+        try:
+            from .crypto import load_key
+            key = load_key(kp)
+            if len(key) == 32:
+                _pass("Master key readable (256-bit)")
+            else:
+                _fail(f"Master key wrong size ({len(key)} bytes, expected 32)")
+                key = None
+        except Exception as e:
+            _fail(f"Master key unreadable: {e}")
+    elif os.environ.get("KV_MASTER_KEY", "").strip():
+        try:
+            import base64
+            key = base64.urlsafe_b64decode(os.environ["KV_MASTER_KEY"].strip())
+            if len(key) == 32:
+                _pass(f"Master key from KV_MASTER_KEY env var (256-bit)")
+            else:
+                _fail(f"KV_MASTER_KEY wrong size ({len(key)} bytes, expected 32)")
+                key = None
+        except Exception as e:
+            _fail(f"KV_MASTER_KEY env var invalid: {e}")
+    else:
+        _fail(f"Master key missing  {DIM}{kp}{RESET}")
+
+    # 4. Config valid
+    config = None
+    try:
+        config = load_config(root)
+        env_count = len(config.get("environments", []))
+        _pass(f"Config valid ({env_count} environment{'s' if env_count != 1 else ''})")
+    except Exception as e:
+        _fail(f"Config error: {e}")
+
+    # 5. Environments exist
+    envs = []
+    if config:
+        envs = config.get("environments", [])
+        if envs:
+            _pass(f"Environments: {', '.join(envs)}")
+        else:
+            _fail("No environments configured")
+
+    # 6. Default env decryptable
+    if key and envs:
+        default_env = config.get("default_env", envs[0])
+        try:
+            store = SecretStore(root)
+            data = store.load_env(default_env)
+            secrets = data.get("secrets", {})
+            count = len(secrets)
+            _pass(f"Decrypt OK  {DIM}{default_env} ({count} secret{'s' if count != 1 else ''}){RESET}")
+        except FileNotFoundError:
+            _pass(f"Decrypt OK  {DIM}{default_env} (empty, no .enc file yet){RESET}")
+        except Exception as e:
+            _fail(f"Decrypt failed for {default_env}: {e}")
+
+    # 7. MCP module
+    try:
+        importlib.import_module("kv_mcp")
+        _pass("MCP server module available")
+    except ImportError:
+        _warn("MCP server module not found (kv_mcp)")
+
+    # 8. Editor MCP configs
+    for editor, cfg in _EDITOR_CONFIGS.items():
+        config_path = os.path.join(root, cfg["file"])
+        if os.path.isfile(config_path):
+            try:
+                import json as _json
+                with open(config_path, "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+                servers = data.get(cfg["key"], {})
+                if isinstance(servers, dict) and "kv" in servers:
+                    _pass(f"{editor} MCP configured  {DIM}{cfg['file']}{RESET}")
+                else:
+                    _warn(f"{editor} config exists but no kv entry")
+            except Exception:
+                _warn(f"{editor} config exists but invalid JSON")
+        else:
+            _warn(f"{editor} MCP not configured  {DIM}{cfg['file']}{RESET}")
+
+    print()
+    _print_doctor_summary(passed, errors, warnings)
+    if errors:
+        sys.exit(1)
+
+
+def _print_doctor_summary(passed, errors, warnings):
+    total = passed + errors + warnings
+    parts = []
+    if passed:
+        parts.append(f"{GREEN}{passed} passed{RESET}")
+    if errors:
+        parts.append(f"{RED}{errors} error{'s' if errors != 1 else ''}{RESET}")
+    if warnings:
+        parts.append(f"{YELLOW}{warnings} warning{'s' if warnings != 1 else ''}{RESET}")
+    _info(", ".join(parts))
+    print()
+
+
 # ── MCP Editor Setup ─────────────────────────────────────
 
 # Config file paths per editor (relative to project root unless absolute)
@@ -534,6 +728,16 @@ def build_parser():
     # status
     sub.add_parser("status", help="Show project status")
 
+    # doctor
+    sub.add_parser("doctor", help="Check project health")
+
+    # export-key
+    sub.add_parser("export-key", help="Export master key as shareable string")
+
+    # import-key
+    p = sub.add_parser("import-key", help="Import a shared master key")
+    p.add_argument("token", help="Key token (kvkey_...)")
+
     # version
     sub.add_parser("version", help="Print version")
 
@@ -628,6 +832,9 @@ COMMANDS = {
     "envs": cmd_envs,
     "env": cmd_env,
     "status": cmd_status,
+    "doctor": cmd_doctor,
+    "export-key": cmd_export_key,
+    "import-key": cmd_import_key,
     "version": cmd_version,
     "mcp": cmd_mcp,
     "setup": cmd_setup,
