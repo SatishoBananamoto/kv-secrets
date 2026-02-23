@@ -26,24 +26,12 @@ classifiers = [
 dependencies = ["cryptography>=41.0.0"]
 
 [project.urls]
-Homepage = "https://github.com/sathi/kv-secrets"
-Documentation = "https://github.com/sathi/kv-secrets#readme"
-Issues = "https://github.com/sathi/kv-secrets/issues"
+Homepage = "https://github.com/SatishoBananamoto/kv-secrets"
+Documentation = "https://github.com/SatishoBananamoto/kv-secrets#readme"
+Issues = "https://github.com/SatishoBananamoto/kv-secrets/issues"
 
 [project.scripts]
 kv = "kv.cli:main"
 
-[project.optional-dependencies]
-server = [
-    "fastapi>=0.110.0",
-    "uvicorn>=0.27.0",
-    "sqlalchemy[asyncio]>=2.0.0",
-    "aiosqlite>=0.20.0",
-    "asyncpg>=0.29.0",
-    "python-jose[cryptography]>=3.3.0",
-    "bcrypt>=4.0.0",
-    "stripe>=8.0.0",
-]
-
 [tool.hatch.build.targets.wheel]
-packages = ["kv", "kv_mcp", "kv_server"]
+packages = ["kv", "kv_mcp"]
