@@ -29,12 +29,3 @@ jobs:
 
       - name: Run MCP tests
         run: python -Bu tests/test_mcp.py
-
-      - name: Install server dependencies
-        run: pip install ".[server]"
-
-      - name: Verify server package importable
-        run: python -c "import kv_server; print('server package OK')"
-
-      - name: Run e2e tests
-        run: python -Bu tests/test_e2e.py

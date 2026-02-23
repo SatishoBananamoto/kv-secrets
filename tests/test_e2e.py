@@ -27,8 +27,7 @@ for stream in (sys.stdout, sys.stderr, sys.stdin):
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(_TEST_DIR)  # kv-project/
 sys.path.insert(0, PROJECT_ROOT)
-# Ensure subprocesses can also find project packages (CI compat: non-editable
-# installs include all packages, but keep PYTHONPATH as belt-and-suspenders)
+# Propagate to subprocesses (kv_server is gitignored = not pip-installed)
 _pypath = os.environ.get("PYTHONPATH", "")
 if PROJECT_ROOT not in _pypath.split(os.pathsep):
     os.environ["PYTHONPATH"] = PROJECT_ROOT + (os.pathsep + _pypath if _pypath else "")
