@@ -54,6 +54,15 @@ def main():
     if args.allow_reveal:
         profiles.add("reveal")
 
+    if args.allow_reveal:
+        print(
+            "WARNING: --allow-reveal is enabled.\n"
+            "  The AI agent can call kv_get to read secret values in plaintext.\n"
+            "  Consider using kv_run instead — secrets are injected into\n"
+            "  subprocesses without exposing values to the agent.\n",
+            file=sys.stderr,
+        )
+
     from .server import run_server
     run_server(profiles)
 

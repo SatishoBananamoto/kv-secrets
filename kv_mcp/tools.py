@@ -230,10 +230,23 @@ def handle_kv_list(args, store, default_env):
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
+def _redact_secrets(text, secrets):
+    """Replace any secret values in text with [REDACTED].
+
+    Defense-in-depth: even if a subprocess prints a secret to stdout/stderr,
+    the agent never sees the actual value.
+    """
+    for value in secrets.values():
+        if value and len(value) >= 4:  # don't redact very short values (too many false positives)
+            text = text.replace(value, "[REDACTED]")
+    return text
+
+
 def handle_kv_run(args, store, default_env):
     """Handle kv_run tool call. Runs command with secrets as env vars.
 
-    Returns exit code only — no stdout/stderr captured.
+    Captures stdout/stderr and redacts any secret values before returning.
+    The agent gets useful output (errors, logs) but never sees secret values.
     """
     import os
 
@@ -272,10 +285,20 @@ def handle_kv_run(args, store, default_env):
             env=run_env,
             shell=False,
             timeout=RUN_TIMEOUT,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
         )
-        text = f"exit code: {result.returncode}"
+        # Redact secret values from output before returning to agent
+        stdout = _redact_secrets(result.stdout, all_secrets) if result.stdout else ""
+        stderr = _redact_secrets(result.stderr, all_secrets) if result.stderr else ""
+
+        parts = [f"exit code: {result.returncode}"]
+        if stdout.strip():
+            parts.append(f"stdout:\n{stdout.rstrip()}")
+        if stderr.strip():
+            parts.append(f"stderr:\n{stderr.rstrip()}")
+        text = "\n".join(parts)
+
     except subprocess.TimeoutExpired:
         text = f"error: command timed out after {RUN_TIMEOUT}s (process killed)"
         is_error = True

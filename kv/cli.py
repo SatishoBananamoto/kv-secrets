@@ -7,10 +7,11 @@ import sys
 
 from . import __version__
 from .config import (
-    find_project_root, init_project, load_config,
+    find_project_root, init_project, load_config, save_config,
     list_environments, add_environment, secrets_dir, key_path,
 )
-from .store import SecretStore
+from .crypto import is_key_wrapped
+from .store import SecretStore, VaultLockedError
 
 
 # ── ANSI formatting ────────────────────────────────────────
@@ -67,8 +68,53 @@ def _require_project():
 
 
 def _get_store():
-    """Get a SecretStore for the current project."""
-    return SecretStore(_require_project())
+    """Get a SecretStore for the current project.
+
+    If the vault is passphrase-protected, prompts for passphrase (and TOTP
+    if configured). Agents cannot respond to interactive prompts — this is
+    the security boundary.
+    """
+    root = _require_project()
+    kp = key_path(root)
+
+    if os.path.isfile(kp) and is_key_wrapped(kp):
+        config = load_config(root)
+        security = config.get("security", {})
+        has_totp = security.get("totp", False)
+
+        # Show lock status
+        lock_type = "passphrase + 2FA" if has_totp else "passphrase"
+        print(f"\n  {BOLD}{CYAN}kv{RESET} {DIM}--{RESET} vault locked {DIM}({lock_type}){RESET}\n")
+
+        passphrase = getpass.getpass(f"  {YELLOW}Passphrase{RESET}: ")
+
+        # Check TOTP if configured
+        if has_totp:
+            totp_enc = security.get("totp_secret_enc")
+            if totp_enc:
+                from .crypto import decrypt_totp_secret, verify_totp
+                try:
+                    totp_secret = decrypt_totp_secret(totp_enc, passphrase)
+                except Exception:
+                    _error("wrong passphrase")
+                    sys.exit(1)
+                code = input(f"  {YELLOW}TOTP code{RESET}:  ").strip()
+                if not verify_totp(totp_secret, code):
+                    _error("invalid TOTP code")
+                    sys.exit(1)
+
+        # Verify passphrase by trying to load key
+        try:
+            store = SecretStore(root, passphrase=passphrase)
+            _ = store.master_key
+        except Exception:
+            _error("wrong passphrase")
+            sys.exit(1)
+
+        print(f"  {GREEN}unlocked{RESET}\n")
+        return store
+
+    return SecretStore(root)
 
 
 def _get_env(args):
@@ -84,8 +130,33 @@ def _get_env(args):
 
 def cmd_init(args):
     """Initialize a new kv project."""
+    # Prompt for passphrase (recommended)
+    passphrase = None
+    if not args.no_passphrase:
+        _header("vault setup")
+        print()
+        _info(f"Set a passphrase to protect your master key.")
+        _info(f"{DIM}This prevents AI agents from reading secrets via shell access.{RESET}")
+        _info(f"{DIM}Press Enter to skip (not recommended).{RESET}")
+        print()
+        p1 = getpass.getpass(f"  {YELLOW}Passphrase{RESET}: ")
+        if p1:
+            p2 = getpass.getpass(f"  {YELLOW}Confirm{RESET}:    ")
+            if p1 != p2:
+                _error("passphrases don't match")
+                sys.exit(1)
+            from .crypto import check_passphrase_strength
+            ok, reason = check_passphrase_strength(p1)
+            if not ok:
+                _error(reason)
+                sys.exit(1)
+            passphrase = p1
+        else:
+            print(f"  {YELLOW}!{RESET} skipping passphrase {DIM}-- master key stored in plaintext{RESET}")
+            print()
+
     try:
-        root = init_project()
+        root = init_project(passphrase=passphrase)
     except FileExistsError:
         _error("already initialized in this directory")
         sys.exit(1)
@@ -93,12 +164,17 @@ def cmd_init(args):
     sdir = secrets_dir(root)
     _header("initialized")
     print()
-    _info(f"{YELLOW}Master key{RESET}   {sdir}{os.sep}key  {RED}{BOLD}(DO NOT COMMIT){RESET}")
+    if passphrase:
+        _info(f"{YELLOW}Master key{RESET}   {sdir}{os.sep}key  {GREEN}(passphrase-protected){RESET}")
+    else:
+        _info(f"{YELLOW}Master key{RESET}   {sdir}{os.sep}key  {RED}{BOLD}(DO NOT COMMIT){RESET}")
     _info(f"{YELLOW}Config{RESET}       {sdir}{os.sep}config.json")
     _info(f"{YELLOW}Gitignore{RESET}    {sdir}{os.sep}.gitignore  {DIM}(auto-configured){RESET}")
     print()
     _info(f"Environments: {GREEN}dev{RESET} (default)")
-    _info(f"{DIM}Set your first secret: python -m kv set DATABASE_URL=...{RESET}")
+    if passphrase:
+        _info(f"{DIM}Add 2FA: kv setup-2fa{RESET}")
+    _info(f"{DIM}Set your first secret: kv set DATABASE_URL=...{RESET}")
     print()
 
 
@@ -658,6 +734,142 @@ def cmd_setup(args):
     print()
 
 
+# ── Security commands ─────────────────────────────────────
+
+
+def cmd_setup_2fa(args):
+    """Set up TOTP two-factor authentication."""
+    from .crypto import (
+        generate_totp_secret, totp_uri, verify_totp,
+        encrypt_totp_secret, is_key_wrapped,
+    )
+
+    root = _require_project()
+    config = load_config(root)
+    security = config.get("security", {})
+
+    if not security.get("passphrase"):
+        _error("2FA requires a passphrase-protected vault")
+        _info(f"{DIM}run 'kv upgrade-security' first{RESET}")
+        sys.exit(1)
+
+    if security.get("totp"):
+        _error("2FA is already configured")
+        _info(f"{DIM}to reconfigure, remove 'totp' from .secrets/config.json{RESET}")
+        sys.exit(1)
+
+    _header("2FA setup")
+    print()
+
+    # Need passphrase to encrypt the TOTP secret
+    passphrase = getpass.getpass(f"  {YELLOW}Passphrase{RESET}: ")
+
+    # Verify passphrase works by trying to load the key
+    kp = key_path(root)
+    try:
+        from .crypto import load_wrapped_key
+        load_wrapped_key(kp, passphrase)
+    except Exception:
+        _error("wrong passphrase")
+        sys.exit(1)
+
+    print(f"  {GREEN}verified{RESET}\n")
+
+    # Generate TOTP secret
+    secret = generate_totp_secret()
+    uri = totp_uri(secret)
+
+    _info("Scan this QR code with your authenticator app:")
+    _info(f"{DIM}(Google Authenticator, Authy, or any TOTP app){RESET}")
+    print()
+
+    # Try to render QR code in terminal
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(uri)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+        print()
+    except ImportError:
+        _info(f"{DIM}install 'qrcode' for QR display: pip install kv-secrets[totp]{RESET}")
+        print()
+
+    _info(f"{DIM}Or enter manually:{RESET}")
+    _kv_line("Secret", secret)
+    print()
+
+    _info(f"Verify setup {DIM}-- enter a code from your app:{RESET}")
+    code = input(f"  {YELLOW}Code{RESET}:  ").strip()
+    if not verify_totp(secret, code):
+        _error("invalid code — 2FA not enabled")
+        _info(f"{DIM}check your authenticator app time is synced{RESET}")
+        sys.exit(1)
+
+    # Encrypt and store TOTP secret in config
+    encrypted = encrypt_totp_secret(secret, passphrase)
+    security["totp"] = True
+    security["totp_secret_enc"] = encrypted
+    config["security"] = security
+    save_config(root, config)
+
+    print()
+    _success(f"2FA enabled {DIM}-- passphrase + authenticator code required{RESET}")
+    print()
+
+
+def cmd_upgrade_security(args):
+    """Upgrade an existing plaintext vault to passphrase-protected."""
+    from .crypto import load_key, save_wrapped_key, is_key_wrapped
+
+    root = _require_project()
+    kp = key_path(root)
+
+    if not os.path.isfile(kp):
+        _error("no master key found")
+        sys.exit(1)
+
+    if is_key_wrapped(kp):
+        _error("vault is already passphrase-protected")
+        sys.exit(1)
+
+    # Read the plaintext key
+    master_key = load_key(kp)
+
+    _header("upgrade security")
+    print()
+    _info("Encrypt your master key with a passphrase.")
+    _info(f"{DIM}After this, every operation requires your passphrase.{RESET}")
+    _info(f"{DIM}AI agents with shell access will not be able to read secrets.{RESET}")
+    print()
+
+    p1 = getpass.getpass(f"  {YELLOW}New passphrase{RESET}: ")
+    from .crypto import check_passphrase_strength
+    ok, reason = check_passphrase_strength(p1)
+    if not ok:
+        _error(reason)
+        sys.exit(1)
+    p2 = getpass.getpass(f"  {YELLOW}Confirm{RESET}:        ")
+    if p1 != p2:
+        _error("passphrases don't match")
+        sys.exit(1)
+
+    # Wrap and overwrite
+    save_wrapped_key(master_key, p1, kp)
+
+    # Update config
+    config = load_config(root)
+    if "security" not in config:
+        config["security"] = {}
+    config["security"]["passphrase"] = True
+    save_config(root, config)
+
+    print()
+    _success(f"master key encrypted {DIM}-- passphrase required for all operations{RESET}")
+    _info(f"{DIM}next: add 2FA with 'kv setup-2fa'{RESET}")
+    print()
+
+
 # ── Argument parser ────────────────────────────────────────
 
 def build_parser():
@@ -672,7 +884,11 @@ def build_parser():
     sub = parser.add_subparsers(dest="command")
 
     # init
-    sub.add_parser("init", help="Initialize a new kv project")
+    p = sub.add_parser("init", help="Initialize a new kv project")
+    p.add_argument(
+        "--no-passphrase", action="store_true",
+        help="Skip passphrase setup (not recommended)",
+    )
 
     # set
     p = sub.add_parser("set", help="Set a secret")
@@ -751,6 +967,10 @@ def build_parser():
     p.add_argument("editor", help="Editor name: cursor, claude-code, vscode")
     p.add_argument("--allow-mutate", action="store_true", help="Enable mutate tools")
     p.add_argument("--allow-reveal", action="store_true", help="Enable reveal tools")
+
+    # security
+    sub.add_parser("setup-2fa", help="Enable TOTP two-factor authentication")
+    sub.add_parser("upgrade-security", help="Add passphrase protection to existing vault")
 
     # ── Remote commands ───────────────────────────────────
 
@@ -838,6 +1058,8 @@ COMMANDS = {
     "version": cmd_version,
     "mcp": cmd_mcp,
     "setup": cmd_setup,
+    "setup-2fa": cmd_setup_2fa,
+    "upgrade-security": cmd_upgrade_security,
     # Remote
     "signup": cmd_signup,
     "login": cmd_login,

@@ -25,6 +25,9 @@ classifiers = [
 ]
 dependencies = ["cryptography>=41.0.0"]
 
+[project.optional-dependencies]
+totp = ["qrcode>=7.0"]
+
 [project.urls]
 Homepage = "https://github.com/SatishoBananamoto/kv-secrets"
 Documentation = "https://github.com/SatishoBananamoto/kv-secrets#readme"

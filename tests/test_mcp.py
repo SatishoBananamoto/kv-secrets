@@ -346,8 +346,11 @@ def test_handlers_kv_run_no_stdout():
         test("kv_run does NOT leak stdout secret",
              "super_secret_123" not in text,
              f"got: {text}")
-        test("kv_run only returns exit code",
-             text == "exit code: 0",
+        test("kv_run redacts secret in output",
+             "[REDACTED]" in text,
+             f"got: {text}")
+        test("kv_run includes exit code",
+             text.startswith("exit code: 0"),
              f"got: {text}")
 
 

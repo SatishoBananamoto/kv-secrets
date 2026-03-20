@@ -4,11 +4,78 @@ Handles: initialize, notifications/initialized, tools/list, tools/call.
 Enforces tool profiles (safe/mutate/reveal) and version negotiation.
 """
 
+import os
 import sys
 import time
 
-from kv.config import find_project_root, get_default_env
+from kv.config import find_project_root, get_default_env, load_config, key_path
+from kv.crypto import is_key_wrapped, decrypt_totp_secret, verify_totp
 from kv.store import SecretStore
+
+
+def _tty_prompt(prompt, hide=False):
+    """Read input directly from /dev/tty, bypassing stdin.
+
+    MCP uses stdin for JSON-RPC. We must read auth prompts from the
+    terminal directly so the passphrase never enters the MCP channel.
+
+    Fallback chain:
+      1. /dev/tty (Unix — reads from controlling terminal regardless of stdin)
+      2. getpass (tries /dev/tty internally, then stderr+stdin fallback)
+      3. KV_PASSPHRASE env var (CI/headless — less secure but functional)
+      4. Fail with clear message
+    """
+    # Attempt 1: /dev/tty (cleanest — completely bypasses stdin)
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        tty_file = os.fdopen(tty_fd, "r+", closefd=True)
+        try:
+            tty_file.write(prompt)
+            tty_file.flush()
+            if hide:
+                try:
+                    import termios
+                    old = termios.tcgetattr(tty_file)
+                    new = list(old)
+                    new[3] = new[3] & ~termios.ECHO
+                    termios.tcsetattr(tty_file, termios.TCSANOW, new)
+                    value = tty_file.readline().rstrip("\n")
+                    tty_file.write("\n")
+                    tty_file.flush()
+                    termios.tcsetattr(tty_file, termios.TCSANOW, old)
+                except ImportError:
+                    value = tty_file.readline().rstrip("\n")
+            else:
+                value = tty_file.readline().rstrip("\n")
+        finally:
+            tty_file.close()
+        return value
+    except OSError:
+        pass
+
+    # Attempt 2: getpass (for passphrase — has its own /dev/tty + fallback logic)
+    if hide:
+        import getpass
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+        try:
+            return getpass.getpass("")
+        except EOFError:
+            pass
+
+    # Attempt 3: environment variable (headless/CI fallback)
+    if hide:
+        env_pass = os.environ.get("KV_PASSPHRASE", "").strip()
+        if env_pass:
+            log("using KV_PASSPHRASE from environment (headless mode)")
+            return env_pass
+
+    # No terminal available
+    log("error: no terminal available for interactive auth")
+    log("  options:")
+    log("  1. run 'python -m kv_mcp' from a terminal with a TTY")
+    log("  2. set KV_PASSPHRASE env var (less secure, for headless/CI)")
+    sys.exit(1)
 
 from .protocol import read_message, write_message, make_response, make_error, log, ParseError
 from .tools import TOOLS, HANDLERS, get_tools_for_profiles
@@ -36,7 +103,44 @@ def run_server(profiles):
         log("error: no kv project found (run 'kv init' first)")
         sys.exit(1)
 
-    store = SecretStore(root)
+    # Passphrase + TOTP authentication at startup
+    #
+    # Critical: MCP uses stdin/stdout for JSON-RPC. We read auth prompts
+    # from /dev/tty directly so the passphrase never touches the MCP channel.
+    # The agent cannot see or intercept the prompts.
+    # The decrypted key lives only in this process's memory.
+    passphrase = None
+    kp = key_path(root)
+    if is_key_wrapped(kp):
+        log("vault is passphrase-protected — prompting via /dev/tty")
+        passphrase = _tty_prompt("  kv passphrase: ", hide=True)
+
+        config = load_config(root)
+        security = config.get("security", {})
+        if security.get("totp"):
+            totp_enc = security.get("totp_secret_enc")
+            if totp_enc:
+                try:
+                    totp_secret = decrypt_totp_secret(totp_enc, passphrase)
+                except Exception:
+                    log("wrong passphrase")
+                    sys.exit(1)
+                code = _tty_prompt("  TOTP code: ", hide=False)
+                if not verify_totp(totp_secret, code):
+                    log("invalid TOTP code")
+                    sys.exit(1)
+
+        # Verify passphrase works before entering the server loop
+        try:
+            test_store = SecretStore(root, passphrase=passphrase)
+            _ = test_store.master_key  # triggers unwrap
+        except Exception:
+            log("wrong passphrase")
+            sys.exit(1)
+
+        log("vault unlocked — key held in memory")
+
+    store = SecretStore(root, passphrase=passphrase)
     default_env = get_default_env(root)
 
     log(f"started (root={root}, profiles={sorted(profiles)})")

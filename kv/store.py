@@ -7,7 +7,10 @@ import json
 import os
 from datetime import datetime, timezone
 
-from .crypto import load_key, derive_env_key, encrypt, decrypt
+from .crypto import (
+    load_key, derive_env_key, encrypt, decrypt,
+    is_key_wrapped, load_wrapped_key,
+)
 from .config import secrets_dir, key_path, add_environment, list_environments
 
 
@@ -16,19 +19,35 @@ MAGIC = b"KV\x00"
 VERSION = 1
 
 
+class VaultLockedError(Exception):
+    """Raised when a passphrase-protected vault is accessed without unlocking."""
+    pass
+
+
 class SecretStore:
     """Manages encrypted secrets for a project."""
 
-    def __init__(self, project_root):
+    def __init__(self, project_root, passphrase=None):
         self.root = project_root
         self._master_key = None
+        self._passphrase = passphrase
 
     @property
     def master_key(self):
         if self._master_key is None:
             kp = key_path(self.root)
             if os.path.isfile(kp):
-                self._master_key = load_key(kp)
+                if is_key_wrapped(kp):
+                    # Passphrase-protected key
+                    if self._passphrase is None:
+                        raise VaultLockedError(
+                            "vault is locked (passphrase-protected)\n"
+                            "  this key is encrypted — a passphrase is required"
+                        )
+                    self._master_key = load_wrapped_key(kp, self._passphrase)
+                else:
+                    # Legacy plaintext key
+                    self._master_key = load_key(kp)
             else:
                 # CI/CD fallback: base64url-encoded key from environment
                 env_key = os.environ.get("KV_MASTER_KEY", "").strip()

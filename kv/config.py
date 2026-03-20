@@ -7,7 +7,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-from .crypto import generate_master_key, save_key
+from .crypto import generate_master_key, save_key, save_wrapped_key
 
 
 SECRETS_DIR = ".secrets"
@@ -47,10 +47,11 @@ def secrets_dir(project_root):
     return os.path.join(project_root, SECRETS_DIR)
 
 
-def init_project(project_root=None):
+def init_project(project_root=None, passphrase=None):
     """Initialize a new kv project.
 
     Creates .secrets/ with master key, config.json, .gitignore, and default dev env.
+    If passphrase is provided, the master key is encrypted with it.
     Returns the project root path.
     """
     root = project_root or os.getcwd()
@@ -63,7 +64,11 @@ def init_project(project_root=None):
 
     # Generate and save master key
     master = generate_master_key()
-    save_key(master, os.path.join(sdir, KEY_FILE))
+    kp = os.path.join(sdir, KEY_FILE)
+    if passphrase:
+        save_wrapped_key(master, passphrase, kp)
+    else:
+        save_key(master, kp)
 
     # Write config
     config = {
@@ -72,6 +77,10 @@ def init_project(project_root=None):
         "default_env": "dev",
         "environments": ["dev"],
         "cipher": "chacha20-poly1305",
+        "security": {
+            "passphrase": bool(passphrase),
+            "totp": False,
+        },
     }
     _write_config(sdir, config)
 
