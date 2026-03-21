@@ -6,6 +6,7 @@
   reveal (opt-in): kv_get
 """
 
+import json
 import subprocess
 import sys
 import time
@@ -91,6 +92,49 @@ TOOLS = {
                 },
             },
             "required": ["argv"],
+        },
+        "profile": "safe",
+    },
+    "kv_api": {
+        "name": "kv_api",
+        "description": (
+            "[SAFE] Make an HTTP API call with credentials injected by the kv daemon. "
+            "The API key is held in the daemon's memory — it never enters your environment, "
+            "never appears in tool responses, and never touches the filesystem. "
+            "Supports: openai, anthropic, google, github, google-cloud. "
+            "The daemon adds the correct auth header/param automatically. "
+            "Returns the API response body (with any secret values redacted)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "description": "API provider name: openai, anthropic, google, github, google-cloud",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "API endpoint path (e.g. /v1/chat/completions, /v1/models)",
+                },
+                "method": {
+                    "type": "string",
+                    "description": "HTTP method (default: POST)",
+                    "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body (JSON). Omit for GET requests.",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Extra headers to include (auth headers are added automatically).",
+                },
+                "env": {
+                    "type": "string",
+                    "description": "Environment name (default: project default)",
+                },
+            },
+            "required": ["provider", "path"],
         },
         "profile": "safe",
     },
@@ -353,6 +397,100 @@ def handle_kv_run(args, store, default_env):
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
+def handle_kv_api(args, store, default_env):
+    """Handle kv_api tool call. Makes HTTP API call with credentials injected.
+
+    If store is None (daemon mode), delegates to the agent daemon.
+    The API key never appears in the response — it stays in the daemon's memory.
+    """
+    provider = args.get("provider")
+    path = args.get("path")
+
+    if not provider:
+        return {"content": [{"type": "text", "text": "error: provider is required (openai, anthropic, google, github, google-cloud)"}], "isError": True}
+    if not path:
+        return {"content": [{"type": "text", "text": "error: path is required (e.g. /v1/chat/completions)"}], "isError": True}
+
+    env_name = _get_env_name(args, default_env)
+
+    # Always delegate to daemon — daemon holds secrets and makes the call
+    if store is None:
+        from kv.agent import agent_request
+        try:
+            result = agent_request(
+                "api",
+                provider=provider,
+                path=path,
+                method=args.get("method", "POST"),
+                body=args.get("body"),
+                headers=args.get("headers", {}),
+                env=env_name,
+            )
+            if "error" in result:
+                text = f"HTTP {result.get('status', 'error')}: {result['error']}"
+                if result.get("body"):
+                    text += f"\n{json.dumps(result['body']) if isinstance(result['body'], (dict, list)) else result['body']}"
+                return {"content": [{"type": "text", "text": text}], "isError": True}
+            else:
+                body = result.get("body", {})
+                text = json.dumps(body, indent=2) if isinstance(body, (dict, list)) else str(body)
+                return {"content": [{"type": "text", "text": text}], "isError": False}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"error: agent daemon unavailable — {e}"}], "isError": True}
+
+    # Direct mode (no daemon) — use providers module directly
+    from kv.providers import get_provider, build_auth, build_url, list_providers
+    import urllib.request
+    import urllib.error
+    import ssl
+
+    prov = get_provider(provider)
+    if not prov:
+        available = ", ".join(list_providers())
+        return {"content": [{"type": "text", "text": f"error: unknown provider '{provider}'. available: {available}"}], "isError": True}
+
+    secret_name = prov["secret_name"]
+    all_secrets = store.get_all_secrets(env_name)
+    secret_value = all_secrets.get(secret_name)
+    if not secret_value:
+        return {"content": [{"type": "text", "text": f"error: secret '{secret_name}' not found in env '{env_name}'"}], "isError": True}
+
+    method = args.get("method", "POST").upper()
+    body = args.get("body")
+    extra_headers = args.get("headers", {})
+
+    auth_headers, auth_params = build_auth(prov, secret_value)
+    url = build_url(prov, path, auth_params)
+    headers = {**auth_headers, **extra_headers}
+
+    body_bytes = None
+    if body is not None:
+        body_bytes = json.dumps(body).encode("utf-8") if isinstance(body, (dict, list)) else body.encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
+            resp_body = resp.read().decode("utf-8")
+            # Redact secrets from response
+            for v in all_secrets.values():
+                if v and len(v) >= 4:
+                    resp_body = resp_body.replace(v, "[REDACTED]")
+            text = resp_body
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            pass
+        text = f"HTTP {e.code}: {e.reason}\n{error_body}"
+        return {"content": [{"type": "text", "text": text}], "isError": True}
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}
+
+    return {"content": [{"type": "text", "text": text}], "isError": False}
+
+
 def handle_kv_set(args, store, default_env):
     """Handle kv_set tool call."""
     name = args.get("name")
@@ -403,6 +541,7 @@ HANDLERS = {
     "kv_envs": handle_kv_envs,
     "kv_list": handle_kv_list,
     "kv_run": handle_kv_run,
+    "kv_api": handle_kv_api,
     "kv_set": handle_kv_set,
     "kv_rm": handle_kv_rm,
     "kv_get": handle_kv_get,

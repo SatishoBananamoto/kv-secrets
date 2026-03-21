@@ -23,6 +23,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import urllib.request
+import urllib.error
+import ssl
 
 SOCK_DIR = os.path.join(tempfile.gettempdir(), "kv-agent")
 SOCK_FILENAME = "kv.sock"
@@ -85,6 +88,96 @@ def agent_request(cmd, **kwargs):
     sock.close()
 
     return json.loads(b"".join(chunks))
+
+
+API_TIMEOUT = 120  # seconds — API calls can be slow (image gen, long completions)
+
+
+def _providers_module():
+    """Lazy import to avoid circular deps."""
+    from . import providers
+    return providers
+
+
+def _handle_api_call(request, all_secrets, env_name):
+    """Handle an 'api' command — make HTTP call with injected credentials.
+
+    The API key never leaves this process. The agent gets the response body.
+    """
+    provider_name = request.get("provider")
+    if not provider_name:
+        return {"error": "provider is required (e.g. openai, anthropic, google)"}
+
+    providers = _providers_module()
+    provider = providers.get_provider(provider_name)
+    if not provider:
+        available = ", ".join(providers.list_providers())
+        return {"error": f"unknown provider: {provider_name}. available: {available}"}
+
+    # Get the secret for this provider
+    secrets = all_secrets.get(env_name, {})
+    secret_name = provider["secret_name"]
+    secret_value = secrets.get(secret_name)
+    if not secret_value:
+        return {"error": f"secret '{secret_name}' not found in env '{env_name}'"}
+
+    # Build the request
+    path = request.get("path", "/")
+    method = request.get("method", "POST").upper()
+    body = request.get("body")
+    extra_headers = request.get("headers", {})
+
+    # Build auth
+    auth_headers, auth_params = providers.build_auth(provider, secret_value)
+    url = providers.build_url(provider, path, auth_params)
+
+    # Merge headers: default + auth + extra (extra can override)
+    headers = {**auth_headers, **extra_headers}
+
+    # Encode body
+    body_bytes = None
+    if body is not None:
+        if isinstance(body, (dict, list)):
+            body_bytes = json.dumps(body).encode("utf-8")
+        elif isinstance(body, str):
+            body_bytes = body.encode("utf-8")
+
+    # Make the HTTP call
+    try:
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+        ctx = ssl.create_default_context()
+
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT, context=ctx) as resp:
+            resp_body = resp.read().decode("utf-8")
+            status = resp.status
+
+            # Redact any secret values from response (defense-in-depth)
+            resp_body = _redact(resp_body, secrets)
+
+            # Try to parse as JSON for clean output
+            try:
+                resp_json = json.loads(resp_body)
+                return {"status": status, "body": resp_json}
+            except json.JSONDecodeError:
+                return {"status": status, "body": resp_body}
+
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")
+            error_body = _redact(error_body, secrets)
+        except Exception:
+            pass
+        return {"error": f"HTTP {e.code}: {e.reason}", "status": e.code, "body": error_body}
+
+    except urllib.error.URLError as e:
+        return {"error": f"connection error: {e.reason}"}
+
+    except TimeoutError:
+        return {"error": f"timeout ({API_TIMEOUT}s)"}
+
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)}"}
 
 
 def run_agent(store, default_env):
@@ -201,7 +294,15 @@ def run_agent(store, default_env):
                     "pid": pid,
                     "environments": env_count,
                     "secrets": secret_count,
+                    "providers": list(_providers_module().list_providers()),
                 }
+
+            elif cmd == "api":
+                # Make HTTP API call with credentials injected
+                # The agent specifies provider + path + body
+                # The daemon injects auth and makes the call
+                # The key NEVER leaves this process
+                response = _handle_api_call(request, all_secrets, env_name)
 
             else:
                 response = {"error": f"unknown command: {cmd}"}
