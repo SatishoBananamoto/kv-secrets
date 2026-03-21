@@ -56,37 +56,89 @@ def _check_exfiltration(argv):
     return True, ""
 
 
-def _scan_for_leaked_files(secrets, before_times, scan_dirs=None):
-    """Scan for files created/modified during subprocess execution
-    that contain secret values. Returns list of (path, secret_name) tuples.
+def _build_secret_variants(secrets):
+    """Build plaintext + base64/hex encoded variants of secrets for scanning."""
+    import base64
+    variants = {}  # value_to_check → secret_name
+    for name, value in secrets.items():
+        if not value or len(value) < 8:
+            continue
+        # Plaintext
+        variants[value] = name
+        # Base64 encoded
+        try:
+            b64 = base64.b64encode(value.encode()).decode()
+            if len(b64) >= 12:
+                variants[b64] = name
+        except Exception:
+            pass
+        # URL-safe base64
+        try:
+            b64url = base64.urlsafe_b64encode(value.encode()).decode()
+            if len(b64url) >= 12 and b64url != b64:
+                variants[b64url] = name
+        except Exception:
+            pass
+        # Hex encoded
+        try:
+            hexval = value.encode().hex()
+            if len(hexval) >= 16:
+                variants[hexval] = name
+        except Exception:
+            pass
+        # Reversed (simple obfuscation)
+        reversed_val = value[::-1]
+        if len(reversed_val) >= 8:
+            variants[reversed_val] = name
+    return variants
+
+
+def _scan_for_leaked_files(secrets, before_times, scan_dirs=None, max_depth=3):
+    """Scan recursively for files created/modified during subprocess execution
+    that contain secret values (plaintext, base64, hex, reversed).
+    Returns list of (path, secret_name) tuples.
     """
     if scan_dirs is None:
         scan_dirs = [tempfile.gettempdir()]
 
+    variants = _build_secret_variants(secrets)
     leaked = []
-    for scan_dir in scan_dirs:
-        if not os.path.isdir(scan_dir):
-            continue
+    seen_dirs = set()
+
+    def _scan_dir(dirpath, depth):
+        if depth > max_depth:
+            return
+        real = os.path.realpath(dirpath)
+        if real in seen_dirs:
+            return
+        seen_dirs.add(real)
+
         try:
-            for entry in os.scandir(scan_dir):
-                if not entry.is_file():
-                    continue
+            for entry in os.scandir(dirpath):
                 try:
-                    mtime = entry.stat().st_mtime
-                    # Only check files modified after subprocess started
-                    if mtime < before_times:
-                        continue
-                    # Read and check for secret values
-                    with open(entry.path, "r", errors="ignore") as f:
-                        content = f.read(1024 * 1024)  # max 1MB
-                    for name, value in secrets.items():
-                        if value and len(value) >= 8 and value in content:
-                            leaked.append((entry.path, name))
-                            break
+                    if entry.is_dir(follow_symlinks=False):
+                        _scan_dir(entry.path, depth + 1)
+                    elif entry.is_file(follow_symlinks=False):
+                        stat = entry.stat()
+                        if stat.st_mtime < before_times:
+                            continue
+                        if stat.st_size > 10 * 1024 * 1024:  # skip files > 10MB
+                            continue
+                        with open(entry.path, "r", errors="ignore") as f:
+                            content = f.read(1024 * 1024)  # read max 1MB
+                        for variant, name in variants.items():
+                            if variant in content:
+                                leaked.append((entry.path, name))
+                                break
                 except (PermissionError, OSError):
                     continue
         except (PermissionError, OSError):
-            continue
+            pass
+
+    for scan_dir in scan_dirs:
+        if os.path.isdir(scan_dir):
+            _scan_dir(scan_dir, 0)
+
     return leaked
 
 

@@ -51,7 +51,14 @@ Agent (sandboxed or not)
 - [x] Verify key never appears in agent context — confirmed
 - [x] Verify key never appears in response — confirmed, clean JSON
 
-### Chunk 6: Commit + push
+### Chunk 6: kv_run exfiltration protection
+- [x] Layer 1: command pattern validation (printenv >, env >, echo $, tee)
+- [x] Layer 2: post-execution file scan (/tmp, ~, cwd) — top-level only
+- [x] Layer 2 fix: recursive directory scan (max depth 3, cycle-safe)
+- [x] Layer 2 fix: base64, urlsafe-b64, hex, reversed variant detection
+- [ ] Known limitation: network exfiltration (requires OS egress control, can't fix in app)
+
+### Chunk 7: Commit + push
 - [ ] Update BUILD.md with results
 - [ ] Commit with descriptive message
 - [ ] Push to GitHub
