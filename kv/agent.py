@@ -203,6 +203,39 @@ def _can_unshare_net():
     return _unshare_available
 
 
+def _track_new_files(before_time, scan_dirs, tracked_set, max_depth=3):
+    """Add all files created/modified during kv_run to the tracked set.
+
+    This catches files regardless of encoding — if it was born during
+    a secret-injected subprocess, it's suspicious.
+    """
+    seen = set()
+
+    def _walk(dirpath, depth):
+        if depth > max_depth:
+            return
+        real = os.path.realpath(dirpath)
+        if real in seen:
+            return
+        seen.add(real)
+        try:
+            for entry in os.scandir(dirpath):
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        _walk(entry.path, depth + 1)
+                    elif entry.is_file(follow_symlinks=False):
+                        if entry.stat().st_mtime >= before_time:
+                            tracked_set.add(os.path.realpath(entry.path))
+                except (PermissionError, OSError):
+                    continue
+        except (PermissionError, OSError):
+            pass
+
+    for d in scan_dirs:
+        if os.path.isdir(d):
+            _walk(d, 0)
+
+
 def _redact(text, secrets):
     """Replace secret values in text with [REDACTED]."""
     for value in secrets.values():
@@ -395,6 +428,10 @@ def run_agent(store, default_env):
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    # Files created during kv_run that may contain secrets.
+    # The PreToolUse hook checks this list to block reads.
+    tracked_files = set()
+
     pid = os.getpid()
     secret_count = sum(len(v) for v in all_secrets.values())
     env_count = len(envs)
@@ -465,6 +502,7 @@ def run_agent(store, default_env):
                             leak_warning = ""
                             if leaked:
                                 for path, name in leaked:
+                                    tracked_files.add(path)
                                     try:
                                         os.unlink(path)
                                     except OSError:
@@ -474,6 +512,11 @@ def run_agent(store, default_env):
                                     f"\n[SECURITY] detected and deleted {len(leaked)} "
                                     f"file(s) containing secrets: {', '.join(leak_names)}"
                                 )
+
+                            # Track ALL new files (not just ones with detected secrets)
+                            # Exotic encodings may bypass variant detection,
+                            # but the file is still suspicious if created during kv_run
+                            _track_new_files(before_time, scan_dirs, tracked_files)
 
                             response = {
                                 "exit_code": result.returncode,
@@ -507,10 +550,19 @@ def run_agent(store, default_env):
 
             elif cmd == "api":
                 # Make HTTP API call with credentials injected
-                # The agent specifies provider + path + body
-                # The daemon injects auth and makes the call
-                # The key NEVER leaves this process
                 response = _handle_api_call(request, all_secrets, env_name)
+
+            elif cmd == "check_file":
+                # Check if a file path is tracked (created during kv_run)
+                # Used by the PreToolUse hook to block reads
+                file_path = request.get("path", "")
+                real_path = os.path.realpath(file_path) if file_path else ""
+                is_tracked = real_path in tracked_files
+                response = {"tracked": is_tracked, "path": real_path}
+
+            elif cmd == "tracked_files":
+                # List all tracked files (for debugging)
+                response = {"files": sorted(tracked_files), "count": len(tracked_files)}
 
             else:
                 response = {"error": f"unknown command: {cmd}"}

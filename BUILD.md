@@ -58,7 +58,15 @@ Agent (sandboxed or not)
 - [x] Layer 2 fix: base64, urlsafe-b64, hex, reversed variant detection
 - [ ] Known limitation: network exfiltration (requires OS egress control, can't fix in app)
 
-### Chunk 7: Commit + push
+### Chunk 7: PreToolUse hook — block reads of files created during kv_run
+- [x] kv_run: track ALL new files created during execution in daemon memory
+- [x] New daemon commands: `check_file` (single path check) + `tracked_files` (list all)
+- [x] kv hook: `python3 -m kv.hook` reads PreToolUse JSON, checks tracked files via daemon
+- [x] Hook blocks: cat, head, tail, less, more, Read tool → deny without prompt
+- [ ] Register kv as PreToolUse hook in .claude/settings (needs user to configure)
+- [ ] Live test: write encoded secret via kv_run → try to read via Bash → blocked
+
+### Chunk 8: Commit + push
 - [ ] Update BUILD.md with results
 - [ ] Commit with descriptive message
 - [ ] Push to GitHub
