@@ -33,6 +33,16 @@ SOCK_FILENAME = "kv.sock"
 MAX_MSG = 1024 * 1024  # 1MB max message size
 RUN_TIMEOUT = 60  # seconds
 
+# Shells that must not be invoked via kv_run
+_BLOCKED_SHELLS = {"bash", "sh", "zsh", "dash", "csh", "tcsh", "fish", "ksh"}
+
+# Programs that support inline code execution (-c, -e flags)
+_INLINE_CODE_FLAGS = {
+    "python": "-c", "python3": "-c", "python2": "-c",
+    "node": "-e", "ruby": "-e", "perl": "-e",
+    "lua": "-e", "php": "-r",
+}
+
 # Patterns that indicate file-write exfiltration attempts
 _EXFIL_PATTERNS = [
     "printenv >", "printenv>>", "env >", "env>>",
@@ -44,15 +54,42 @@ _EXFIL_PATTERNS = [
 
 
 def _check_exfiltration(argv):
-    """Check if a command looks like a secret exfiltration attempt.
+    """Analyze a command for exfiltration risk before execution.
 
-    Returns (safe, reason). This is advisory — catches obvious attacks
-    like 'printenv > /tmp/file' but not sophisticated ones.
+    Three checks:
+    1. Block shell invocations (bash, sh, etc.) — eliminates pipes, redirects
+    2. Block inline code execution (python3 -c, node -e) — eliminates script injection
+    3. Block known exfiltration patterns (printenv >, etc.) — catches remaining patterns
+
+    Returns (safe, reason).
     """
+    if not argv:
+        return True, ""
+
+    program = os.path.basename(argv[0]).lower()
+
+    # Check 1: Block shell invocations
+    if program in _BLOCKED_SHELLS:
+        return False, (
+            f"blocked: shell '{program}' not allowed in kv_run. "
+            f"Run a script file instead (e.g., python3 app.py)"
+        )
+
+    # Check 2: Block inline code execution
+    if program in _INLINE_CODE_FLAGS:
+        flag = _INLINE_CODE_FLAGS[program]
+        if flag in argv[1:]:
+            return False, (
+                f"blocked: inline code execution ('{program} {flag}') not allowed in kv_run. "
+                f"Write your code to a file and run that instead"
+            )
+
+    # Check 3: Pattern matching for remaining exfiltration vectors
     cmd_str = " ".join(argv).lower()
     for pattern in _EXFIL_PATTERNS:
         if pattern.lower() in cmd_str:
             return False, f"blocked: command matches exfiltration pattern '{pattern.strip()}'"
+
     return True, ""
 
 
