@@ -25,29 +25,31 @@ import sys
 import os
 
 
-# Commands that read files
-_READ_COMMANDS = {"cat", "head", "tail", "less", "more", "bat", "hexdump", "xxd", "strings"}
+def _extract_all_paths(command_str):
+    """Extract all tokens that look like file paths from a Bash command.
 
-
-def _extract_file_paths_from_bash(command_str):
-    """Extract potential file paths from a Bash command."""
+    Checks every token — not just arguments to read commands.
+    Any command (grep, cp, base64, awk, python3, etc.) that references
+    a tracked file path will be caught.
+    """
+    import shlex
     paths = []
-    parts = command_str.split()
-    skip_next = False
-    for i, part in enumerate(parts):
-        if skip_next:
-            skip_next = False
-            continue
+    try:
+        parts = shlex.split(command_str)
+    except ValueError:
+        parts = command_str.split()
+
+    for part in parts:
+        # Skip flags, operators, and very short tokens
         if part.startswith("-"):
-            if part in ("-n", "-c", "-o", "-e"):
-                skip_next = True
             continue
-        if i == 0 or part in _READ_COMMANDS:
+        if part in ("|", ">", ">>", "<", "&&", "||", ";", "2>&1"):
             continue
-        if part in ("|", ">", ">>", "<", "&&", "||", ";"):
-            continue
-        if "/" in part or "." in part:
-            paths.append(part)
+        # Anything with a / or starting with . or ~ looks like a path
+        if "/" in part or part.startswith(".") or part.startswith("~"):
+            # Expand ~ to home dir
+            expanded = os.path.expanduser(part)
+            paths.append(expanded)
     return paths
 
 
@@ -90,9 +92,9 @@ def main():
 
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        first_word = command.strip().split()[0] if command.strip() else ""
-        if first_word in _READ_COMMANDS:
-            paths_to_check = _extract_file_paths_from_bash(command)
+        # Check ALL tokens in the command for tracked file paths
+        # Don't filter by command name — any command can read files
+        paths_to_check = _extract_all_paths(command)
 
     elif tool_name == "Read":
         file_path = tool_input.get("file_path", "")
