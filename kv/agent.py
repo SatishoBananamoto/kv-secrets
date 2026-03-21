@@ -179,6 +179,30 @@ def _scan_for_leaked_files(secrets, before_times, scan_dirs=None, max_depth=3):
     return leaked
 
 
+_unshare_available = None  # cached result
+
+
+def _can_unshare_net():
+    """Check if 'unshare --user --net' is available on this system.
+
+    Caches the result — only tests once per daemon lifetime.
+    """
+    global _unshare_available
+    if _unshare_available is not None:
+        return _unshare_available
+
+    try:
+        result = subprocess.run(
+            ["unshare", "--user", "--net", "true"],
+            capture_output=True, timeout=5,
+        )
+        _unshare_available = result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        _unshare_available = False
+
+    return _unshare_available
+
+
 def _redact(text, secrets):
     """Replace secret values in text with [REDACTED]."""
     for value in secrets.values():
@@ -419,9 +443,17 @@ def run_agent(store, default_env):
                             os.getcwd(),
                         ]
                         before_time = time.time()
+
+                        # Network isolation: run subprocess in an empty
+                        # network namespace if available. The subprocess
+                        # can use secrets but cannot send them anywhere.
+                        run_argv = argv
+                        if _can_unshare_net():
+                            run_argv = ["unshare", "--user", "--net"] + argv
+
                         try:
                             result = subprocess.run(
-                                argv, env=run_env, shell=False,
+                                run_argv, env=run_env, shell=False,
                                 capture_output=True, text=True,
                                 timeout=RUN_TIMEOUT,
                             )
