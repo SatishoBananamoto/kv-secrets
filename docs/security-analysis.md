@@ -311,6 +311,18 @@ The `kv_run` tool — inject secrets into a subprocess, return only the output �
 
 This is a one-way mirror: the agent sees through to the output, but can't see the secrets that produced it.
 
+**Caveat discovered during testing (2026-03-21):** The one-way mirror has a hole. The subprocess runs with secrets as environment variables and has full filesystem write access. An adversarial agent can:
+
+```bash
+# Via kv_run or agent daemon:
+run(argv=["bash", "-c", "printenv > /tmp/leak.txt"])
+# Then read /tmp/leak.txt directly — all secrets in plaintext
+```
+
+Output redaction only protects the communication channel (socket/MCP response). It cannot prevent a subprocess from writing its own environment to the filesystem. This is a fundamental limitation of env-var-based secret injection — the same limitation Docker secrets, Kubernetes env vars, and ssh-agent face.
+
+The `kv_run` pattern still catches **accidental** leaks (secrets in error messages, debug output). It does not prevent **deliberate** exfiltration by an adversarial agent. True containment requires OS-level subprocess sandboxing.
+
 ### 8.4 Interactive authentication should be standard for sensitive MCP servers
 
 MCP servers that manage credentials, secrets, or other sensitive resources should require interactive authentication at startup. This creates a Tier 2 interface barrier that the agent cannot bypass through MCP or Bash.
@@ -336,7 +348,8 @@ No third-party systems were tested or attacked. All exploitation was performed o
 | SVX can be disabled by agent via Bash config overwrite | High | Documented, fix designed |
 | Weak passphrase brute-forced in 6 seconds | High | Fixed (common password blocklist) |
 | Operational leak (passphrase/TOTP in chat) | Medium | Mitigated (QR code, user education) |
-| Subprocess output can leak secrets | Medium | Fixed (output redaction in kv_run) |
+| Subprocess output can leak secrets via stdout | Medium | Fixed (output redaction in kv_run) |
+| Subprocess can write secrets to filesystem via kv_run | High | Known limitation — env vars + filesystem access = exfiltration possible |
 | TOTP secret coupled to passphrase | Low | By design (local-only constraint) |
 
 ---

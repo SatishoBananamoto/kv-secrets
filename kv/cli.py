@@ -130,6 +130,14 @@ def _get_env(args):
 
 def cmd_init(args):
     """Initialize a new kv project."""
+    # Check FIRST — don't prompt for passphrase if already initialized
+    from .config import secrets_dir as _sdir, SECRETS_DIR
+    check_path = os.path.join(os.getcwd(), SECRETS_DIR)
+    if os.path.exists(check_path):
+        _error("already initialized in this directory")
+        _info(f"{DIM}vault exists at {check_path}{RESET}")
+        sys.exit(1)
+
     # Prompt for passphrase (recommended)
     passphrase = None
     if not args.no_passphrase:
@@ -155,11 +163,7 @@ def cmd_init(args):
             print(f"  {YELLOW}!{RESET} skipping passphrase {DIM}-- master key stored in plaintext{RESET}")
             print()
 
-    try:
-        root = init_project(passphrase=passphrase)
-    except FileExistsError:
-        _error("already initialized in this directory")
-        sys.exit(1)
+    root = init_project(passphrase=passphrase)
 
     sdir = secrets_dir(root)
     _header("initialized")
@@ -870,6 +874,57 @@ def cmd_upgrade_security(args):
     print()
 
 
+def cmd_agent(args):
+    """Start the kv agent daemon — unlock once, use everywhere."""
+    from .agent import is_agent_running, run_agent
+
+    if is_agent_running():
+        _error("agent is already running")
+        _info(f"{DIM}stop it first with Ctrl+C in the agent terminal{RESET}")
+        sys.exit(1)
+
+    root = _require_project()
+    kp = key_path(root)
+
+    # Prompt for passphrase + TOTP
+    passphrase = None
+    if os.path.isfile(kp) and is_key_wrapped(kp):
+        config = load_config(root)
+        security = config.get("security", {})
+        has_totp = security.get("totp", False)
+
+        lock_type = "passphrase + 2FA" if has_totp else "passphrase"
+        _header(f"agent unlock ({lock_type})")
+        print()
+
+        passphrase = getpass.getpass(f"  {YELLOW}Passphrase{RESET}: ")
+
+        if has_totp:
+            totp_enc = security.get("totp_secret_enc")
+            if totp_enc:
+                from .crypto import decrypt_totp_secret, verify_totp
+                try:
+                    totp_secret = decrypt_totp_secret(totp_enc, passphrase)
+                except Exception:
+                    _error("wrong passphrase")
+                    sys.exit(1)
+                code = input(f"  {YELLOW}TOTP code{RESET}:  ").strip()
+                if not verify_totp(totp_secret, code):
+                    _error("invalid TOTP code")
+                    sys.exit(1)
+
+    store = SecretStore(root, passphrase=passphrase)
+    try:
+        _ = store.master_key
+    except Exception:
+        _error("wrong passphrase")
+        sys.exit(1)
+
+    from .config import get_default_env
+    default_env = get_default_env(root)
+    run_agent(store, default_env)
+
+
 # ── Argument parser ────────────────────────────────────────
 
 def build_parser():
@@ -971,6 +1026,7 @@ def build_parser():
     # security
     sub.add_parser("setup-2fa", help="Enable TOTP two-factor authentication")
     sub.add_parser("upgrade-security", help="Add passphrase protection to existing vault")
+    sub.add_parser("agent", help="Start agent daemon — unlock once, use everywhere")
 
     # ── Remote commands ───────────────────────────────────
 
@@ -1060,6 +1116,7 @@ COMMANDS = {
     "setup": cmd_setup,
     "setup-2fa": cmd_setup_2fa,
     "upgrade-security": cmd_upgrade_security,
+    "agent": cmd_agent,
     # Remote
     "signup": cmd_signup,
     "login": cmd_login,

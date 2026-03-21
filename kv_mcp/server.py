@@ -8,6 +8,7 @@ import os
 import sys
 import time
 
+from kv.agent import is_agent_running
 from kv.config import find_project_root, get_default_env, load_config, key_path
 from kv.crypto import is_key_wrapped, decrypt_totp_secret, verify_totp
 from kv.store import SecretStore
@@ -103,47 +104,75 @@ def run_server(profiles):
         log("error: no kv project found (run 'kv init' first)")
         sys.exit(1)
 
-    # Passphrase + TOTP authentication at startup
+    # Authentication strategy (in priority order):
     #
-    # Critical: MCP uses stdin/stdout for JSON-RPC. We read auth prompts
-    # from /dev/tty directly so the passphrase never touches the MCP channel.
-    # The agent cannot see or intercept the prompts.
-    # The decrypted key lives only in this process's memory.
-    passphrase = None
-    kp = key_path(root)
-    if is_key_wrapped(kp):
-        log("vault is passphrase-protected — prompting via /dev/tty")
-        passphrase = _tty_prompt("  kv passphrase: ", hide=True)
+    # 1. kv agent daemon running → delegate all operations to it via socket
+    #    (no passphrase needed — agent daemon already authenticated)
+    # 2. KV_PASSPHRASE env var → unlock vault directly
+    # 3. /dev/tty prompt → interactive unlock
+    # 4. Fail with instructions
+    use_agent_daemon = False
 
-        config = load_config(root)
-        security = config.get("security", {})
-        if security.get("totp"):
-            totp_enc = security.get("totp_secret_enc")
-            if totp_enc:
-                try:
-                    totp_secret = decrypt_totp_secret(totp_enc, passphrase)
-                except Exception:
-                    log("wrong passphrase")
-                    sys.exit(1)
-                code = _tty_prompt("  TOTP code: ", hide=False)
-                if not verify_totp(totp_secret, code):
-                    log("invalid TOTP code")
-                    sys.exit(1)
+    if is_agent_running():
+        log("kv agent daemon detected — delegating via socket")
+        use_agent_daemon = True
+    else:
+        passphrase = None
+        kp = key_path(root)
 
-        # Verify passphrase works before entering the server loop
-        try:
-            test_store = SecretStore(root, passphrase=passphrase)
-            _ = test_store.master_key  # triggers unwrap
-        except Exception:
-            log("wrong passphrase")
-            sys.exit(1)
+        if is_key_wrapped(kp):
+            requires_auth = "mutate" in profiles or "reveal" in profiles
 
-        log("vault unlocked — key held in memory")
+            if requires_auth:
+                log("vault is passphrase-protected — prompting via /dev/tty")
+                passphrase = _tty_prompt("  kv passphrase: ", hide=True)
 
-    store = SecretStore(root, passphrase=passphrase)
+                config = load_config(root)
+                security = config.get("security", {})
+                if security.get("totp"):
+                    totp_enc = security.get("totp_secret_enc")
+                    if totp_enc:
+                        try:
+                            totp_secret = decrypt_totp_secret(totp_enc, passphrase)
+                        except Exception:
+                            log("wrong passphrase")
+                            sys.exit(1)
+                        code = _tty_prompt("  TOTP code: ", hide=False)
+                        if not verify_totp(totp_secret, code):
+                            log("invalid TOTP code")
+                            sys.exit(1)
+            else:
+                # Safe profile — try env var, then /dev/tty, then fail with instructions
+                env_pass = os.environ.get("KV_PASSPHRASE", "").strip()
+                if env_pass:
+                    passphrase = env_pass
+                    log("using KV_PASSPHRASE from environment")
+                else:
+                    try:
+                        passphrase = _tty_prompt("  kv passphrase: ", hide=True)
+                    except SystemExit:
+                        log("error: vault is locked and no agent daemon running")
+                        log("  start the agent first: kv agent")
+                        log("  or set KV_PASSPHRASE env var")
+                        sys.exit(1)
+
+            try:
+                test_store = SecretStore(root, passphrase=passphrase)
+                _ = test_store.master_key
+            except Exception:
+                log("wrong passphrase")
+                sys.exit(1)
+
+            log("vault unlocked — key held in memory")
+
+    if use_agent_daemon:
+        store = None  # operations delegated to agent daemon
+    else:
+        store = SecretStore(root, passphrase=passphrase)
     default_env = get_default_env(root)
 
-    log(f"started (root={root}, profiles={sorted(profiles)})")
+    log(f"started (root={root}, profiles={sorted(profiles)}"
+        f"{', via agent daemon' if use_agent_daemon else ''})")
 
     initialized = False
     negotiated_version = LATEST_VERSION

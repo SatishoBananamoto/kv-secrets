@@ -206,6 +206,11 @@ def _get_env_name(args, default_env):
 
 def handle_kv_status(args, store, default_env):
     """Handle kv_status tool call."""
+    if store is None:
+        from kv.agent import agent_request
+        result = agent_request("status")
+        text = f"project: initialized (via agent daemon)\npid: {result.get('pid')}\nenvironments: {result.get('environments')}\nsecrets: {result.get('secrets')}"
+        return {"content": [{"type": "text", "text": text}], "isError": False}
     root = store.root
     envs = list_environments(root)
     count = store.env_count(default_env)
@@ -215,6 +220,12 @@ def handle_kv_status(args, store, default_env):
 
 def handle_kv_envs(args, store, default_env):
     """Handle kv_envs tool call."""
+    if store is None:
+        from kv.agent import agent_request
+        result = agent_request("envs")
+        envs = result.get("environments", [])
+        text = "\n".join(envs) if envs else "(no environments)"
+        return {"content": [{"type": "text", "text": text}], "isError": False}
     root = store.root
     envs = list_environments(root)
     text = "\n".join(envs) if envs else "(no environments)"
@@ -224,6 +235,12 @@ def handle_kv_envs(args, store, default_env):
 def handle_kv_list(args, store, default_env):
     """Handle kv_list tool call. Returns key names only — no values."""
     env = _get_env_name(args, default_env)
+    if store is None:
+        from kv.agent import agent_request
+        result = agent_request("list", env=env)
+        names = result.get("keys", [])[:MAX_LIST_KEYS]
+        text = "\n".join(names) if names else "(no secrets)"
+        return {"content": [{"type": "text", "text": text}], "isError": False}
     secrets = store.list_secrets(env)
     names = [k for k, v in secrets][:MAX_LIST_KEYS]
     text = "\n".join(names) if names else "(no secrets)"
@@ -247,6 +264,8 @@ def handle_kv_run(args, store, default_env):
 
     Captures stdout/stderr and redacts any secret values before returning.
     The agent gets useful output (errors, logs) but never sees secret values.
+
+    If store is None, delegates to the kv agent daemon via Unix socket.
     """
     import os
 
@@ -264,10 +283,32 @@ def handle_kv_run(args, store, default_env):
             return {"content": [{"type": "text", "text": f"error: argv[{i}] exceeds max length ({MAX_ARGV_LEN})"}], "isError": True}
 
     env_name = _get_env_name(args, default_env)
+
+    # Delegate to agent daemon if store is None (daemon mode)
+    if store is None:
+        from kv.agent import agent_request
+        try:
+            result = agent_request("run", argv=argv, env=env_name)
+            if "error" in result:
+                text = f"error: {result['error']}"
+                is_error = True
+            else:
+                parts = [f"exit code: {result.get('exit_code', 1)}"]
+                if result.get("stdout", "").strip():
+                    parts.append(f"stdout:\n{result['stdout'].rstrip()}")
+                if result.get("stderr", "").strip():
+                    parts.append(f"stderr:\n{result['stderr'].rstrip()}")
+                text = "\n".join(parts)
+                is_error = result.get("exit_code", 1) != 0
+        except Exception as e:
+            text = f"error: agent daemon unavailable — {e}"
+            is_error = True
+        return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+    # Direct mode — store has the key
     all_secrets = store.get_all_secrets(env_name)
 
     # Filter to requested env_names if specified
-    # None/absent = inject all secrets; empty list = inject none
     env_names = args.get("env_names")
     if env_names is not None:
         secrets = {k: v for k, v in all_secrets.items() if k in env_names}
