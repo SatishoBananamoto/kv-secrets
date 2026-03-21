@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import ssl
@@ -31,6 +32,62 @@ SOCK_DIR = os.path.join(tempfile.gettempdir(), "kv-agent")
 SOCK_FILENAME = "kv.sock"
 MAX_MSG = 1024 * 1024  # 1MB max message size
 RUN_TIMEOUT = 60  # seconds
+
+# Patterns that indicate file-write exfiltration attempts
+_EXFIL_PATTERNS = [
+    "printenv >", "printenv>>", "env >", "env>>",
+    "export >", "export>>", "echo $", "echo ${",
+    "> /tmp/", ">> /tmp/", "tee /tmp/", "tee -a /tmp/",
+    "> /var/tmp/", ">> /var/tmp/",
+    ">/tmp/", ">>/tmp/",
+]
+
+
+def _check_exfiltration(argv):
+    """Check if a command looks like a secret exfiltration attempt.
+
+    Returns (safe, reason). This is advisory — catches obvious attacks
+    like 'printenv > /tmp/file' but not sophisticated ones.
+    """
+    cmd_str = " ".join(argv).lower()
+    for pattern in _EXFIL_PATTERNS:
+        if pattern.lower() in cmd_str:
+            return False, f"blocked: command matches exfiltration pattern '{pattern.strip()}'"
+    return True, ""
+
+
+def _scan_for_leaked_files(secrets, before_times, scan_dirs=None):
+    """Scan for files created/modified during subprocess execution
+    that contain secret values. Returns list of (path, secret_name) tuples.
+    """
+    if scan_dirs is None:
+        scan_dirs = [tempfile.gettempdir()]
+
+    leaked = []
+    for scan_dir in scan_dirs:
+        if not os.path.isdir(scan_dir):
+            continue
+        try:
+            for entry in os.scandir(scan_dir):
+                if not entry.is_file():
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                    # Only check files modified after subprocess started
+                    if mtime < before_times:
+                        continue
+                    # Read and check for secret values
+                    with open(entry.path, "r", errors="ignore") as f:
+                        content = f.read(1024 * 1024)  # max 1MB
+                    for name, value in secrets.items():
+                        if value and len(value) >= 8 and value in content:
+                            leaked.append((entry.path, name))
+                            break
+                except (PermissionError, OSError):
+                    continue
+        except (PermissionError, OSError):
+            continue
+    return leaked
 
 
 def _redact(text, secrets):
@@ -259,26 +316,56 @@ def run_agent(store, default_env):
                 if not argv:
                     response = {"error": "argv required", "exit_code": 1}
                 else:
-                    secrets = all_secrets.get(env_name, {})
-                    run_env = dict(os.environ)
-                    run_env.update(secrets)
-                    try:
-                        result = subprocess.run(
-                            argv, env=run_env, shell=False,
-                            capture_output=True, text=True,
-                            timeout=RUN_TIMEOUT,
-                        )
-                        stdout = _redact(result.stdout, secrets) if result.stdout else ""
-                        stderr = _redact(result.stderr, secrets) if result.stderr else ""
-                        response = {
-                            "exit_code": result.returncode,
-                            "stdout": stdout,
-                            "stderr": stderr,
-                        }
-                    except subprocess.TimeoutExpired:
-                        response = {"error": f"timeout ({RUN_TIMEOUT}s)", "exit_code": 1}
-                    except FileNotFoundError:
-                        response = {"error": f"command not found: {argv[0]}", "exit_code": 1}
+                    # Layer 1: Block obvious exfiltration patterns
+                    safe, reason = _check_exfiltration(argv)
+                    if not safe:
+                        response = {"error": reason, "exit_code": 1}
+                    else:
+                        secrets = all_secrets.get(env_name, {})
+                        run_env = dict(os.environ)
+                        run_env.update(secrets)
+                        scan_dirs = [
+                            tempfile.gettempdir(),
+                            os.path.expanduser("~"),
+                            os.getcwd(),
+                        ]
+                        before_time = time.time()
+                        try:
+                            result = subprocess.run(
+                                argv, env=run_env, shell=False,
+                                capture_output=True, text=True,
+                                timeout=RUN_TIMEOUT,
+                            )
+                            stdout = _redact(result.stdout, secrets) if result.stdout else ""
+                            stderr = _redact(result.stderr, secrets) if result.stderr else ""
+
+                            # Layer 2: Post-execution scan for leaked files
+                            leaked = _scan_for_leaked_files(secrets, before_time, scan_dirs)
+                            leak_warning = ""
+                            if leaked:
+                                for path, name in leaked:
+                                    try:
+                                        os.unlink(path)
+                                    except OSError:
+                                        pass
+                                leak_names = [f"{name} → {path}" for path, name in leaked]
+                                leak_warning = (
+                                    f"\n[SECURITY] detected and deleted {len(leaked)} "
+                                    f"file(s) containing secrets: {', '.join(leak_names)}"
+                                )
+
+                            response = {
+                                "exit_code": result.returncode,
+                                "stdout": stdout,
+                                "stderr": stderr,
+                            }
+                            if leak_warning:
+                                response["warning"] = leak_warning
+
+                        except subprocess.TimeoutExpired:
+                            response = {"error": f"timeout ({RUN_TIMEOUT}s)", "exit_code": 1}
+                        except FileNotFoundError:
+                            response = {"error": f"command not found: {argv[0]}", "exit_code": 1}
 
             elif cmd == "list":
                 # Return key names only — NEVER values
