@@ -561,8 +561,24 @@ def run_agent(store, default_env):
                 response = {"tracked": is_tracked, "path": real_path}
 
             elif cmd == "tracked_files":
-                # List all tracked files (for debugging)
+                # List all tracked files (for hook to check)
                 response = {"files": sorted(tracked_files), "count": len(tracked_files)}
+
+            elif cmd == "secret_names":
+                # Return secret key names (not values) — for hook to know what to scan for
+                secrets = all_secrets.get(env_name, {})
+                response = {"names": sorted(secrets.keys())}
+
+            elif cmd == "check_leak":
+                # Check if text contains any secret values
+                # Used by PostToolUse hook to detect leaks in Bash output
+                text = request.get("text", "")
+                secrets = all_secrets.get(env_name, {})
+                leaked_names = []
+                for name, value in secrets.items():
+                    if value and len(value) >= 8 and value in text:
+                        leaked_names.append(name)
+                response = {"leaked": leaked_names}
 
             else:
                 response = {"error": f"unknown command: {cmd}"}
