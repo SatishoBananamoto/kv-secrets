@@ -280,6 +280,6 @@ The MCP connection is the link: kv-secrets provides secrets to the same AI agent
 
 kv-secrets is the most complete and most shippable project in the portfolio. It's on PyPI, has CI/CD with security scanning, comprehensive documentation, a monetization plan, and the MCP security profiles are a genuinely novel idea. The live vulnerability finding (agent Bash bypass of MCP profiles) is serious but fixable — the passphrase solution is ~50 lines of code and uses the same security model as ssh-agent and gpg-agent. The vulnerability exists in every local secret manager; kv-secrets is the only one that even considers AI agent access as a threat vector.
 
-**Grade: B+** (downgraded from A- due to confirmed vulnerability)
-Best execution in the portfolio — shipped, documented, security-scanned, monetization-planned. Downgraded from A- because a live security test bypassed the MCP profiles in one Bash command. Restores to A- once passphrase-wrapped key ships. The tool isn't failed — it needs one security layer to match its own ambition.
+**Grade: A-** (restored from B+ — passphrase + TOTP shipped 2026-03-21)
+Best execution in the portfolio — shipped, documented, security-scanned, monetization-planned. Was B+ due to confirmed MCP profile bypass via Bash. Passphrase-wrapped key + TOTP 2FA + output redaction + password blocklist now shipped. The vulnerability that prompted the downgrade is fixed. Remaining gaps: CLI command tests, server documentation.
 
