@@ -1,11 +1,9 @@
 """kv PreToolUse hook — blocks reads of files created during kv_run.
 
-Registered as a Claude Code PreToolUse hook. When the agent tries to
-read a file that was created during a secret-injected subprocess,
-the hook denies the operation without prompting the user.
-
-This closes the last exfiltration gap: even if a subprocess writes
-an encoded secret to disk, the agent cannot read it back.
+Matches SVX's proven hook pattern:
+- Reads tool input from stdin as JSON
+- Outputs {} for allow, hookSpecificOutput for deny
+- Always exits 0
 
 Usage in .claude/settings.local.json:
 {
@@ -13,7 +11,9 @@ Usage in .claude/settings.local.json:
     "PreToolUse": [
       {
         "matcher": "Bash|Read",
-        "command": "python3 -m kv.hook"
+        "hooks": [
+          {"type": "command", "command": "python3 -m kv.hook"}
+        ]
       }
     ]
   }
@@ -22,8 +22,7 @@ Usage in .claude/settings.local.json:
 
 import json
 import sys
-
-from .agent import is_agent_running, agent_request
+import os
 
 
 # Commands that read files
@@ -39,43 +38,58 @@ def _extract_file_paths_from_bash(command_str):
         if skip_next:
             skip_next = False
             continue
-        # Skip flags
         if part.startswith("-"):
-            # Some flags take arguments (-n, -c, etc.)
             if part in ("-n", "-c", "-o", "-e"):
                 skip_next = True
             continue
-        # Skip the command itself
         if i == 0 or part in _READ_COMMANDS:
             continue
-        # Skip pipes and redirects
         if part in ("|", ">", ">>", "<", "&&", "||", ";"):
             continue
-        # Remaining tokens are likely file paths
         if "/" in part or "." in part:
             paths.append(part)
     return paths
 
 
+def _allow():
+    """Allow the tool call (print empty JSON, exit 0)."""
+    print(json.dumps({}))
+    sys.exit(0)
+
+
+def _deny(reason):
+    """Deny the tool call (print hookSpecificOutput, exit 0)."""
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+    print(json.dumps(output))
+    sys.exit(0)
+
+
 def main():
     """Hook entry point — reads PreToolUse JSON from stdin."""
     try:
-        data = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, EOFError):
-        sys.exit(0)  # can't parse, allow
+        raw = sys.stdin.read()
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, EOFError):
+        _allow()  # can't parse, fail open
 
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
 
     # Only check if daemon is running (has tracked files)
+    from kv.agent import is_agent_running, agent_request
     if not is_agent_running():
-        sys.exit(0)  # no daemon, allow
+        _allow()
 
     paths_to_check = []
 
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        # Check if command starts with a read command
         first_word = command.strip().split()[0] if command.strip() else ""
         if first_word in _READ_COMMANDS:
             paths_to_check = _extract_file_paths_from_bash(command)
@@ -86,31 +100,22 @@ def main():
             paths_to_check = [file_path]
 
     if not paths_to_check:
-        sys.exit(0)  # no file reads detected, allow
+        _allow()
 
     # Check each path against the daemon's tracked files
     for path in paths_to_check:
         try:
             result = agent_request("check_file", path=path)
             if result.get("tracked"):
-                # This file was created during a kv_run — block the read
-                output = {
-                    "hookSpecificOutput": {
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": (
-                            f"[kv-secrets] blocked: '{path}' was created during a "
-                            f"secret-injected subprocess (kv_run). Reading it could "
-                            f"expose encoded secret values."
-                        ),
-                    }
-                }
-                print(json.dumps(output))
-                sys.exit(0)
+                _deny(
+                    f"[kv-secrets] blocked: '{path}' was created during a "
+                    f"secret-injected subprocess (kv_run). Reading it could "
+                    f"expose encoded secret values."
+                )
         except Exception:
-            continue  # daemon unreachable, allow
+            continue
 
-    # No tracked files found in this command
-    sys.exit(0)
+    _allow()
 
 
 if __name__ == "__main__":
